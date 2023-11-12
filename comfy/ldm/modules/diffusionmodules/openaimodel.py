@@ -251,6 +251,12 @@ class Timestep(nn.Module):
     def forward(self, t):
         return timestep_embedding(t, self.dim)
 
+def apply_control(h, control, name):
+    if control is not None and name in control and len(control[name]) > 0:
+        ctrl = control[name].pop()
+        if ctrl is not None:
+            h += ctrl
+    return h
 
 class UNetModel(nn.Module):
     """
@@ -259,10 +265,6 @@ class UNetModel(nn.Module):
     :param model_channels: base channel count for the model.
     :param out_channels: channels in the output Tensor.
     :param num_res_blocks: number of residual blocks per downsample.
-    :param attention_resolutions: a collection of downsample rates at which
-        attention will take place. May be a set, list, or tuple.
-        For example, if this contains 4, then at 4x downsampling, attention
-        will be used.
     :param dropout: the dropout probability.
     :param channel_mult: channel multiplier for each level of the UNet.
     :param conv_resample: if True, use learned convolutions for upsampling and
@@ -289,7 +291,6 @@ class UNetModel(nn.Module):
         model_channels,
         out_channels,
         num_res_blocks,
-        attention_resolutions,
         dropout=0,
         channel_mult=(1, 2, 4, 8),
         conv_resample=True,
@@ -314,6 +315,7 @@ class UNetModel(nn.Module):
         use_linear_in_transformer=False,
         adm_in_channels=None,
         transformer_depth_middle=None,
+        transformer_depth_output=None,
         device=None,
         operations=comfy.ops,
     ):
@@ -341,10 +343,7 @@ class UNetModel(nn.Module):
         self.in_channels = in_channels
         self.model_channels = model_channels
         self.out_channels = out_channels
-        if isinstance(transformer_depth, int):
-            transformer_depth = len(channel_mult) * [transformer_depth]
-        if transformer_depth_middle is None:
-            transformer_depth_middle =  transformer_depth[-1]
+
         if isinstance(num_res_blocks, int):
             self.num_res_blocks = len(channel_mult) * [num_res_blocks]
         else:
@@ -352,18 +351,16 @@ class UNetModel(nn.Module):
                 raise ValueError("provide num_res_blocks either as an int (globally constant) or "
                                  "as a list/tuple (per-level) with the same length as channel_mult")
             self.num_res_blocks = num_res_blocks
+
         if disable_self_attentions is not None:
             # should be a list of booleans, indicating whether to disable self-attention in TransformerBlocks or not
             assert len(disable_self_attentions) == len(channel_mult)
         if num_attention_blocks is not None:
             assert len(num_attention_blocks) == len(self.num_res_blocks)
-            assert all(map(lambda i: self.num_res_blocks[i] >= num_attention_blocks[i], range(len(num_attention_blocks))))
-            print(f"Constructor of UNetModel received num_attention_blocks={num_attention_blocks}. "
-                  f"This option has LESS priority than attention_resolutions {attention_resolutions}, "
-                  f"i.e., in cases where num_attention_blocks[i] > 0 but 2**i not in attention_resolutions, "
-                  f"attention will still not be set.")
 
-        self.attention_resolutions = attention_resolutions
+        transformer_depth = transformer_depth[:]
+        transformer_depth_output = transformer_depth_output[:]
+
         self.dropout = dropout
         self.channel_mult = channel_mult
         self.conv_resample = conv_resample
@@ -428,7 +425,8 @@ class UNetModel(nn.Module):
                     )
                 ]
                 ch = mult * model_channels
-                if ds in attention_resolutions:
+                num_transformers = transformer_depth.pop(0)
+                if num_transformers > 0:
                     if num_head_channels == -1:
                         dim_head = ch // num_heads
                     else:
@@ -444,7 +442,7 @@ class UNetModel(nn.Module):
 
                     if not exists(num_attention_blocks) or nr < num_attention_blocks[level]:
                         layers.append(SpatialTransformer(
-                                ch, num_heads, dim_head, depth=transformer_depth[level], context_dim=context_dim,
+                                ch, num_heads, dim_head, depth=num_transformers, context_dim=context_dim,
                                 disable_self_attn=disabled_sa, use_linear=use_linear_in_transformer,
                                 use_checkpoint=use_checkpoint, dtype=self.dtype, device=device, operations=operations
                             )
@@ -488,7 +486,7 @@ class UNetModel(nn.Module):
         if legacy:
             #num_heads = 1
             dim_head = ch // num_heads if use_spatial_transformer else num_head_channels
-        self.middle_block = TimestepEmbedSequential(
+        mid_block = [
             ResBlock(
                 ch,
                 time_embed_dim,
@@ -499,8 +497,9 @@ class UNetModel(nn.Module):
                 dtype=self.dtype,
                 device=device,
                 operations=operations
-            ),
-            SpatialTransformer(  # always uses a self-attn
+            )]
+        if transformer_depth_middle >= 0:
+            mid_block += [SpatialTransformer(  # always uses a self-attn
                             ch, num_heads, dim_head, depth=transformer_depth_middle, context_dim=context_dim,
                             disable_self_attn=disable_middle_self_attn, use_linear=use_linear_in_transformer,
                             use_checkpoint=use_checkpoint, dtype=self.dtype, device=device, operations=operations
@@ -515,8 +514,8 @@ class UNetModel(nn.Module):
                 dtype=self.dtype,
                 device=device,
                 operations=operations
-            ),
-        )
+            )]
+        self.middle_block = TimestepEmbedSequential(*mid_block)
         self._feature_size += ch
 
         self.output_blocks = nn.ModuleList([])
@@ -538,7 +537,8 @@ class UNetModel(nn.Module):
                     )
                 ]
                 ch = model_channels * mult
-                if ds in attention_resolutions:
+                num_transformers = transformer_depth_output.pop()
+                if num_transformers > 0:
                     if num_head_channels == -1:
                         dim_head = ch // num_heads
                     else:
@@ -555,7 +555,7 @@ class UNetModel(nn.Module):
                     if not exists(num_attention_blocks) or i < num_attention_blocks[level]:
                         layers.append(
                             SpatialTransformer(
-                                ch, num_heads, dim_head, depth=transformer_depth[level], context_dim=context_dim,
+                                ch, num_heads, dim_head, depth=num_transformers, context_dim=context_dim,
                                 disable_self_attn=disabled_sa, use_linear=use_linear_in_transformer,
                                 use_checkpoint=use_checkpoint, dtype=self.dtype, device=device, operations=operations
                             )
@@ -623,25 +623,17 @@ class UNetModel(nn.Module):
         for id, module in enumerate(self.input_blocks):
             transformer_options["block"] = ("input", id)
             h = forward_timestep_embed(module, h, emb, context, transformer_options)
-            if control is not None and 'input' in control and len(control['input']) > 0:
-                ctrl = control['input'].pop()
-                if ctrl is not None:
-                    h += ctrl
+            h = apply_control(h, control, 'input')
             hs.append(h)
+
         transformer_options["block"] = ("middle", 0)
         h = forward_timestep_embed(self.middle_block, h, emb, context, transformer_options)
-        if control is not None and 'middle' in control and len(control['middle']) > 0:
-            ctrl = control['middle'].pop()
-            if ctrl is not None:
-                h += ctrl
+        h = apply_control(h, control, 'middle')
 
         for id, module in enumerate(self.output_blocks):
             transformer_options["block"] = ("output", id)
             hsp = hs.pop()
-            if control is not None and 'output' in control and len(control['output']) > 0:
-                ctrl = control['output'].pop()
-                if ctrl is not None:
-                    hsp += ctrl
+            hsp = apply_control(hsp, control, 'output')
 
             if "output_block_patch" in transformer_patches:
                 patch = transformer_patches["output_block_patch"]
